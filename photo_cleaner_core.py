@@ -68,6 +68,10 @@ def is_supported_image(path: str | Path) -> bool:
 def build_union_mask(masks: np.ndarray, indices: np.ndarray) -> np.ndarray:
     if masks.size == 0 or len(indices) == 0:
         return np.zeros((0, 0), dtype=bool)
+    
+    # 过滤掉超出 masks 范围的索引
+    valid_mask_count = masks.shape[0]
+    indices = indices[indices < valid_mask_count]
 
     union_mask = np.zeros(masks.shape[1:], dtype=bool)
     for idx in indices:
@@ -167,45 +171,8 @@ def analyze_image(
         raise ValueError(f"无法读取图片: {image_path}")
 
     model = load_model(model_path)
-    results = model(str(image_path), classes=[0],conf=0.05,verbose=False)#conf降低置信度阈值 - 检出更多模糊人物
+    results = model(str(image_path), classes=[0],conf=0.02,verbose=False)#conf降低置信度阈值 - 检出更多模糊人物
 
-
-
-    res = results[0]
-    image_h, image_w = res.orig_shape
-    boxes = res.boxes
-    xyxy = boxes.xyxy.cpu().numpy() if boxes is not None else np.empty((0, 4), dtype=np.float32)
-    conf = boxes.conf.cpu().numpy() if boxes is not None else np.empty((0,), dtype=np.float32)
-    masks = res.masks.data.cpu().numpy() if res.masks is not None else np.array([])
-
-    # 多尺度检测：放大图片检测小人物（如果原图没有检测到足够的人）
-    if len(xyxy) < 20 and image_h * image_w > 100000:  # 如果原图检测少于3人且图片足够大
-        try:
-            large_h, large_w = int(image_h * 1.5), int(image_w * 1.5)
-            large_image = cv2.resize(original_bgr, (large_w, large_h))
-            large_results = model(large_image, classes=[0], conf=0.15, verbose=False)
-            
-            if large_results and large_results[0].masks is not None:
-                scale_x = image_w / large_w
-                scale_y = image_h / large_h
-                large_masks = large_results[0].masks.data.cpu().numpy()
-                
-                resized_masks = []
-                for mask in large_masks:
-                    resized_mask = cv2.resize(mask, (image_w, image_h))
-                    resized_masks.append(resized_mask.astype(bool))
-                large_masks_resized = np.array(resized_masks)
-                
-                # 合并检测结果
-                if len(masks) > 0:
-                    masks = np.concatenate([masks, large_masks_resized], axis=0)
-                else:
-                    masks = large_masks_resized
-        except Exception:
-            pass  # 多尺度检测失败不影响主流程
-
-
-            
     if not results:
         raise RuntimeError("模型没有返回任何结果")
 
@@ -215,6 +182,54 @@ def analyze_image(
     xyxy = boxes.xyxy.cpu().numpy() if boxes is not None else np.empty((0, 4), dtype=np.float32)
     conf = boxes.conf.cpu().numpy() if boxes is not None else np.empty((0,), dtype=np.float32)
     masks = res.masks.data.cpu().numpy() if res.masks is not None else np.array([])
+
+    # 多尺度检测：放大图片检测小人物
+    if len(xyxy) < 50 and image_h * image_w > 50000:
+        try:
+            large_h, large_w = int(image_h * 2), int(image_w * 2)
+            large_image = cv2.resize(original_bgr, (large_w, large_h))
+            large_results = model(large_image, classes=[0], conf=0.15, verbose=False)
+            if large_results and large_results[0].masks is not None:
+                large_boxes = large_results[0].boxes
+                large_xyxy = large_boxes.xyxy.cpu().numpy()
+                large_conf = large_boxes.conf.cpu().numpy()
+                large_masks = large_results[0].masks.data.cpu().numpy()
+                # 缩放坐标映射回原图尺寸
+                scale_x = image_w / large_w
+                scale_y = image_h / large_h
+                large_xyxy_scaled = large_xyxy.copy()
+                large_xyxy_scaled[:, [0, 2]] *= scale_x
+                large_xyxy_scaled[:, [1, 3]] *= scale_y
+                # 缩放 masks 回原图尺寸
+                resized_masks = np.array([
+                    cv2.resize(m.astype(np.float32), (image_w, image_h))
+                    for m in large_masks
+                ])
+                # 去重：只保留多尺度中新发现的人（与原结果 IoU < 0.1）
+                iou_threshold = 0.1
+                new_mask_indices = []
+                for i, new_box in enumerate(large_xyxy_scaled):
+                    is_duplicate = False
+                    for old_box in xyxy[:original_count]:
+                        if compute_iou(new_box, old_box) > iou_threshold:
+                            is_duplicate = True
+                            break
+                    if not is_duplicate:
+                        new_mask_indices.append(i)
+
+                # 用新索引从多尺度结果中提取
+                if new_mask_indices:
+                    new_xyxy = large_xyxy_scaled[new_mask_indices]
+                    new_conf = large_conf[new_mask_indices]
+                    new_masks = resized_masks[new_mask_indices]
+
+                    xyxy = np.concatenate([xyxy, new_xyxy], axis=0)
+                    conf = np.concatenate([conf, new_conf], axis=0)
+                    masks = np.concatenate([masks, new_masks], axis=0)
+        except Exception:
+            pass  # 多尺度失败不影响主流程
+            
+
 
     if len(xyxy) == 0:
         cleaned_image = original_bgr.copy()

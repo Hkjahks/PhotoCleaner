@@ -14,7 +14,7 @@ import numpy as np
 @dataclass
 class LLMSelectionConfig:
     base_url: str = "http://localhost:11434/v1"
-    model: str = "gpt-4o-mini"
+    model: str = "qwen3.5:9b"
     api_key: str = ""
     timeout_seconds: int = 90
     request_mode: str = "auto"
@@ -190,6 +190,86 @@ def call_openai_compatible_vision_model(
     return subject_indices, content
 
 
+def compute_iou(box_a: np.ndarray, box_b: np.ndarray) -> float:
+    x1 = max(box_a[0], box_b[0])
+    y1 = max(box_a[1], box_b[1])
+    x2 = min(box_a[2], box_b[2])
+    y2 = min(box_a[3], box_b[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
+    area_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0
+
+def rule_based_select(
+    detections: list[dict[str, object]],
+    image_h: int,
+    image_w: int,
+) -> tuple[np.ndarray, list[str]]:
+    if not detections:
+        return np.array([], dtype=int), []
+
+    image_area = image_h * image_w
+    center_x, center_y = image_w / 2, image_h / 2
+
+    scores = []
+    for det in detections:
+        box = det["box"]
+        conf = det["conf"]
+        area = det["area"]
+
+        area_ratio = area / image_area
+        area_score = min(area_ratio / 0.05, 1.0) * 40
+
+        x1, y1, x2, y2 = box
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
+        max_dist = np.sqrt(center_x**2 + center_y**2)
+        dist = np.sqrt((cx - center_x)**2 + (cy - center_y)**2)
+        center_score = (1 - dist / max_dist) * 35
+
+        conf_score = conf * 25
+        
+        scores.append(area_score + center_score + conf_score)
+
+    scores = np.array(scores)
+    max_score = scores.max()
+    # 所有候选
+    threshold = max_score * 0.75
+    candidates = np.where(scores >= threshold)[0]
+
+    if len(candidates) <= 1:
+
+        subject_indices = candidates if len(candidates) == 1 else np.array([scores.argmax()])
+
+    else:
+
+        # 按面积从大到小排序
+
+        sorted_idx = np.argsort([detections[i]["area"] for i in candidates])[::-1]
+
+        top_area = detections[candidates[sorted_idx[0]]]["area"]
+
+
+        # 保留面积达到最大值 60% 以上的框
+
+        subject_indices = np.array([candidates[i] for i in sorted_idx
+
+                                   if detections[candidates[i]]["area"] >= top_area * 0.6])
+
+
+    if len(subject_indices) == 0:
+
+        subject_indices = np.array([scores.argmax()])
+
+
+    logs = [...]
+
+    print(f"[DEBUG] 主体: {subject_indices.tolist()}, 分数: {[round(scores[i],1) for i in subject_indices]}")
+
+    return subject_indices.astype(int), logs
+
+
 def llm_subject_select(
     image_bgr: np.ndarray,
     detections: list[dict[str, object]],
@@ -200,6 +280,11 @@ def llm_subject_select(
 
     if llm_config is None:
         llm_config = LLMSelectionConfig()
+
+    # 模型名或地址为空时，直接用规则
+    if not llm_config.model.strip() or not llm_config.base_url.strip():
+        image_h, image_w = image_bgr.shape[:2]
+        return rule_based_select(detections, image_h, image_w)
 
     overlay = render_detection_overlay(image_bgr, detections)
     subject_indices, raw_content = call_openai_compatible_vision_model(
@@ -220,4 +305,23 @@ def select_subject_indices(
     detections: list[dict[str, object]],
     llm_config: LLMSelectionConfig | None = None,
 ) -> tuple[np.ndarray, list[str]]:
-    return llm_subject_select(image_bgr=image_bgr, detections=detections, llm_config=llm_config)
+    if not detections:
+        return np.array([], dtype=int), []
+
+    if llm_config is None:
+        llm_config = LLMSelectionConfig()
+
+    # 模型名或地址为空时，直接用规则
+    if not llm_config.model.strip() or not llm_config.base_url.strip():
+        image_h, image_w = image_bgr.shape[:2]
+        return rule_based_select(detections, image_h, image_w)
+
+    # 尝试调用 LLM，失败则 fallback 到规则
+    try:
+        return llm_subject_select(image_bgr=image_bgr, detections=detections, llm_config=llm_config)
+    except Exception as exc:
+        image_h, image_w = image_bgr.shape[:2]
+        subject_indices, logs = rule_based_select(detections, image_h, image_w)
+        logs.append(f"LLM 调用失败（{type(exc).__name__}: {exc}），自动切换规则判断。")
+        return subject_indices, logs
+
