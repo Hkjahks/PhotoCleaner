@@ -186,6 +186,11 @@ def analyze_image(
             large_results = model(large_image, classes=[0], conf=0.15, verbose=False)
             
             if large_results and large_results[0].masks is not None:
+                large_boxes = large_results[0].boxes
+                large_xyxy = large_boxes.xyxy.cpu().numpy()
+                large_conf = large_boxes.conf.cpu().numpy()
+                large_masks = large_results[0].masks.data.cpu().numpy()
+                # 缩放坐标映射回原图尺寸
                 scale_x = image_w / large_w
                 scale_y = image_h / large_h
                 large_masks = large_results[0].masks.data.cpu().numpy()
