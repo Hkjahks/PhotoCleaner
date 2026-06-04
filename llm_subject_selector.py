@@ -63,7 +63,10 @@ def parse_llm_indices(text: str, total_count: int) -> list[int]:
         try:
             payload = json.loads(candidate)
             if isinstance(payload, dict):
-                subject_indices = payload.get("subject_indices", payload.get("keep_indices", []))
+                subject_indices = payload.get(
+                    "person_indices",
+                    payload.get("subject_indices", payload.get("keep_indices", [])),
+                )
             elif isinstance(payload, list):
                 subject_indices = payload
             else:
@@ -95,21 +98,20 @@ def should_use_vision(config: LLMSelectionConfig) -> bool:
 
 def build_prompt(detections: list[dict[str, object]], use_vision: bool) -> str:
     intro = (
-        "请根据原图和编号框图判断哪些人物应该保留，通常保留的是拍摄主体、最重要的人物、"
-        "以及明确属于同一主体群体的人。\n"
+        "请根据原图和编号框图找出图中所有人物，并返回所有人物编号。\n"
         if use_vision
-        else "请根据候选人物的编号、位置、面积和置信度判断哪些人物应该保留，通常保留的是拍摄主体、最重要的人物、以及明确属于同一主体群体的人。\n"
+        else "请根据候选人物的编号、位置、面积和置信度找出图中所有人物，并返回所有人物编号。\n"
     )
 
     return (
-        "你是照片主体选择器。图中每个检测框都标了编号。\n"
+        "你是照片人物识别器。图中每个检测框都标了编号。\n"
         + intro
         + "只返回 JSON，不要输出多余文字。格式必须是："
-        "{\"subject_indices\":[0,2]}\n"
+        "{\"person_indices\":[0,1,2]}\n"
         "要求：\n"
-        "1. subject_indices 只允许包含整数编号。\n"
-        "2. 如果只有一个主要人物，就只返回那一个编号。\n"
-        "3. 如果多个检测框都属于同一组主体，可以全部返回。\n"
+        "1. person_indices 只允许包含整数编号。\n"
+        "2. 必须返回图中所有人物对应的编号，不要漏掉任何人。\n"
+        "3. 如果看不清某个编号框，也要尽量根据图像内容补全。\n"
         "4. 不要返回解释。\n"
         "候选人物信息：\n"
         + "\n".join(
@@ -211,7 +213,7 @@ def llm_subject_select(
     if not subject_indices:
         raise RuntimeError(f"大模型没有返回有效主体编号: {raw_content}")
 
-    logs = ["大模型已完成主体判断。", f"大模型返回: {raw_content}"]
+    logs = ["Qwen 已完成人物编号识别。", f"Qwen 返回: {raw_content}"]
     return np.array(subject_indices, dtype=int), logs
 
 

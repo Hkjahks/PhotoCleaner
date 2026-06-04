@@ -28,7 +28,7 @@ torch.jit.load = _patched_jit_load
 
 from ultralytics import YOLO
 
-from db import init_db, insert_record
+from db import insert_record
 from llm_subject_selector import LLMSelectionConfig, llm_subject_select
 
 SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg"}
@@ -141,6 +141,11 @@ def remove_stray_people(
     return remove_stray_people_lama(image_bgr, stray_mask)
 
 
+def remove_people_twice(image_bgr: np.ndarray, person_mask: np.ndarray) -> np.ndarray:
+    cleaned_once = remove_stray_people_lama(image_bgr, person_mask)
+    return remove_stray_people_lama(cleaned_once, person_mask)
+
+
 @lru_cache(maxsize=1)
 def load_model(model_path: str = "yolov8s-seg.pt") -> YOLO:
     return YOLO(model_path)
@@ -153,8 +158,6 @@ def analyze_image(
     min_area_ratio: float = 0.01,#降低最小面积阈值 - 检测更小的远处人物
     llm_config: LLMSelectionConfig | None = None,
 ) -> ProcessResult:
-    init_db()
-
     start_time = time.time()
     image_path = Path(image_path)
     if not image_path.exists():
@@ -246,21 +249,24 @@ def analyze_image(
         for i in range(len(xyxy))
     ]
 
-    subject_indices, selector_logs = llm_subject_select(
+    qwen_indices, selector_logs = llm_subject_select(
         image_bgr=original_bgr,
         detections=detections,
         llm_config=llm_config,
     )
 
     all_indices = np.arange(len(xyxy))
-    stray_indices = np.setdiff1d(all_indices, subject_indices)
+    qwen_index_set = set(qwen_indices.tolist())
+    all_index_set = set(all_indices.tolist())
+    if qwen_index_set != all_index_set:
+        selector_logs.append("Qwen 返回的编号不完整，已回退为删除所有检测到的人物。")
+        subject_indices = all_indices
+    else:
+        subject_indices = qwen_indices
 
     subject_mask = build_union_mask(masks, subject_indices)
-    stray_mask = build_union_mask(masks, stray_indices)
-    cleaned_image = remove_stray_people(
-        original_bgr,
-        stray_mask,
-    )
+    stray_mask = np.zeros((image_h, image_w), dtype=bool)
+    cleaned_image = remove_people_twice(original_bgr, subject_mask)
 
     elapsed_seconds = time.time() - start_time
     subject_index_set = set(subject_indices.tolist())
@@ -271,18 +277,18 @@ def analyze_image(
             conf=float(conf[i]),
             score=1.0 if i in subject_index_set else 0.0,
             area=float((xyxy[i, 2] - xyxy[i, 0]) * (xyxy[i, 3] - xyxy[i, 1])),
-            label="subject" if i in subject_indices else "stray",
+            label="person" if i in subject_indices else "background",
         )
         for i in range(len(xyxy))
     ]
 
-    logs = selector_logs + [f"检测到 {len(xyxy)} 个人物，主体 {len(subject_indices)} 个，路人 {len(stray_indices)} 个。"]
+    logs = selector_logs + [f"检测到 {len(xyxy)} 个人物，已全部移除，并重复修复 2 次。"]
 
     return ProcessResult(
         input_path=str(image_path),
         output_path="",
         subject_count=len(subject_indices),
-        stray_count=len(stray_indices),
+        stray_count=0,
         elapsed_seconds=elapsed_seconds,
         original_bgr=original_bgr,
         cleaned_bgr=cleaned_image,
@@ -406,7 +412,7 @@ def format_detection_lines(detections: list[DetectionSummary]) -> list[str]:
     lines: list[str] = []
     for item in detections:
         lines.append(
-            f"#{item.index} {item.label} | conf={item.conf:.3f} | keep={int(item.score > 0)} | area={item.area:.0f}"
+            f"#{item.index} {item.label} | conf={item.conf:.3f} | removed={int(item.score > 0)} | area={item.area:.0f}"
         )
     return lines
 
