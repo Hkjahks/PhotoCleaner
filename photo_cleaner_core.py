@@ -487,24 +487,24 @@ def composite_subjects(
 
 
 def remove_people_twice(image_bgr: np.ndarray, person_mask: np.ndarray) -> np.ndarray:
-    """消除人物：优先使用 Stable Diffusion Inpainting，不可用时回退 LaMa。"""
+    """消除人物：小图用 SD（≤768px），大图用 LaMa（保原生分辨率）。"""
     if person_mask.size == 0:
         return image_bgr.copy()
 
     shape = image_bgr.shape[:2]
+    h, w = shape
 
-    # 尝试 SD Inpainting（效果接近商用级）
-    if _sd_is_available():
+    # SD 需要缩放到 512px 处理，大图缩放后会变糊，仅小图使用
+    if _sd_is_available() and max(h, w) <= 768:
         try:
             mask_dilated = refine_person_mask(person_mask, shape, dilation_pixels=4)
             cleaned = _inpaint_sd(image_bgr, mask_dilated)
-            # SD 输出可能与原图有细微色差，再做一次轻量 LaMa 统一色调
             cleaned = remove_stray_people_lama(cleaned, mask_dilated)
             return cleaned
         except Exception:
             pass  # SD 失败则回退 LaMa
 
-    # LaMa 回退方案
+    # LaMa：原生分辨率，适合大图
     cleaned = remove_stray_people_lama(image_bgr, person_mask)
     mask_edge = refine_person_mask(person_mask, shape, dilation_pixels=2)
     cleaned = remove_stray_people_lama(cleaned, mask_edge)
