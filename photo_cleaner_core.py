@@ -494,8 +494,7 @@ def remove_people_twice(image_bgr: np.ndarray, person_mask: np.ndarray) -> np.nd
     shape = image_bgr.shape[:2]
     h, w = shape
 
-    # SD 需要缩放到 512px 处理，大图缩放后会变糊，仅小图使用
-    if _sd_is_available() and max(h, w) <= 768:
+    if _sd_is_available():
         try:
             mask_dilated = refine_person_mask(person_mask, shape, dilation_pixels=4)
             cleaned = _inpaint_sd(image_bgr, mask_dilated)
