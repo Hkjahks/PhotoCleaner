@@ -440,6 +440,48 @@ def refine_person_mask(mask: np.ndarray, image_shape: tuple[int, int], dilation_
     return cv2.dilate(mask_u8, kernel)
 
 
+def composite_subjects(
+    clean_background: np.ndarray,
+    original_image: np.ndarray,
+    subject_mask: np.ndarray,
+    feather_px: int = 3,
+) -> np.ndarray:
+    """将原图中的主体人物抠出，贴到干净背景上，边缘羽化平滑过渡。"""
+    h, w = clean_background.shape[:2]
+    if subject_mask.shape[:2] != (h, w):
+        subject_mask = cv2.resize(
+            subject_mask.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR
+        )
+
+    mask_bool = subject_mask > 0.5
+    if np.count_nonzero(mask_bool) == 0:
+        return clean_background.copy()
+
+    # 膨胀 mask 形成羽化过渡带
+    ksize = max(3, feather_px * 2 + 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+    mask_dilated = cv2.dilate(mask_bool.astype(np.uint8), kernel).astype(bool)
+    feather_ring = mask_dilated & ~mask_bool
+
+    if np.count_nonzero(feather_ring) == 0:
+        result = clean_background.copy()
+        result[mask_bool] = original_image[mask_bool]
+        return result
+
+    ring_float = feather_ring.astype(np.float32)
+    blur_ksize = max(3, int(np.sqrt(h * h + w * w) / 150))
+    if blur_ksize % 2 == 0:
+        blur_ksize += 1
+    alpha = cv2.GaussianBlur(ring_float, (blur_ksize, blur_ksize), 0)
+    alpha = np.clip(alpha, 0, 1)
+    full_alpha = np.where(mask_bool, 1.0, alpha)
+    alpha_3ch = np.dstack([full_alpha] * 3)
+
+    bg_f = clean_background.astype(np.float32)
+    orig_f = original_image.astype(np.float32)
+    return (orig_f * alpha_3ch + bg_f * (1 - alpha_3ch)).astype(np.uint8)
+
+
 def remove_people_twice(image_bgr: np.ndarray, person_mask: np.ndarray) -> np.ndarray:
     """消除人物：优先使用 Stable Diffusion Inpainting，不可用时回退 LaMa。"""
     if person_mask.size == 0:
@@ -641,12 +683,23 @@ def analyze_image(
     # 规则评分：识别主要人物（保留）和路人（消除）
     subject_indices, stray_indices = select_main_subjects(detections, image_h, image_w)
 
+    # 第一步：消除所有人，得到干净背景
+    all_indices = np.arange(len(xyxy))
+    all_people_mask = build_union_mask(masks, all_indices)
+    clean_background = remove_people_twice(original_bgr, all_people_mask)
+
+    # 第二步：从原图抠出主体人物，贴回干净背景
     subject_mask = build_union_mask(masks, subject_indices)
     stray_mask = build_union_mask(masks, stray_indices)
 
-    if len(stray_indices) > 0:
-        cleaned_image = remove_people_twice(original_bgr, stray_mask)
+    if len(subject_indices) > 0 and len(stray_indices) > 0:
+        # 有路人需要消除，同时保留主体
+        cleaned_image = composite_subjects(clean_background, original_bgr, subject_mask)
+    elif len(stray_indices) > 0:
+        # 全是路人 → 直接输出干净背景
+        cleaned_image = clean_background
     else:
+        # 没有路人 → 原样输出
         cleaned_image = original_bgr.copy()
 
     elapsed_seconds = time.time() - start_time
