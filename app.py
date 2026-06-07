@@ -166,9 +166,9 @@ def render_hero() -> None:
     st.markdown(
         """
         <div class="hero">
-            <h1>PhotoCleaner 全人消除系统</h1>
+            <h1>PhotoCleaner 路人消除系统</h1>
             <p>
-                YOLOv8-seg 检测人物 + LaMa 修复，消除图中所有人，只保留背景环境。
+                智能识别主要人物并保留，仅消除背景路人，适合合影、旅游照等场景。
             </p>
             <div class="feature-grid">
                 <div class="feature-card"><div class="label">输入格式</div><div class="value">PNG / JPG / JPEG</div></div>
@@ -184,7 +184,7 @@ def render_hero() -> None:
 
 def sidebar_settings() -> dict[str, object]:
     st.sidebar.markdown("### 处理说明")
-    st.sidebar.caption("YOLOv8-seg 检测人物 + LaMa 修复，消除图中所有人。")
+    st.sidebar.caption("系统自动识别主要人物并保留，仅消除背景路人。")
     return {}
 
 
@@ -236,7 +236,7 @@ def handle_single_mode(settings: dict[str, object]) -> None:
 
     with right:
         st.markdown("#### 处理说明")
-        st.write("YOLO 检测人物后 LaMa 修复去除，输出只保留背景。")
+        st.write("系统自动识别主要人物并保留，仅消除背景路人。")
         start_button = st.button("开始处理单张图片", use_container_width=True)
 
     if not start_button:

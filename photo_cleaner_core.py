@@ -90,6 +90,67 @@ def compute_iou(box_a: np.ndarray, box_b: np.ndarray) -> float:
     return inter / union if union > 0 else 0
 
 
+def select_main_subjects(
+    detections: list[dict[str, object]],
+    image_h: int,
+    image_w: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """基于面积、位置、置信度评分识别主要人物（保留）和路人（消除）。
+
+    评分权重：面积 40% + 中心偏离 35% + 置信度 25%
+    候选人取最高分 75% 内，再从候选人中按面积筛选。
+    """
+    n = len(detections)
+    if n == 0:
+        return np.array([], dtype=int), np.array([], dtype=int)
+    if n == 1:
+        return np.array([0]), np.array([], dtype=int)
+
+    image_area = image_h * image_w
+    center_x, center_y = image_w / 2, image_h / 2
+
+    scores = []
+    for det in detections:
+        box = det["box"]
+        area = det["area"]
+        conf = det["conf"]
+
+        area_ratio = area / image_area
+        area_score = min(area_ratio / 0.05, 1.0) * 40
+
+        x1, y1, x2, y2 = box
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
+        max_dist = np.sqrt(center_x**2 + center_y**2)
+        dist = np.sqrt((cx - center_x)**2 + (cy - center_y)**2)
+        center_score = (1 - dist / max_dist) * 35
+
+        conf_score = conf * 25
+        scores.append(area_score + center_score + conf_score)
+
+    scores_arr = np.array(scores)
+    threshold = scores_arr.max() * 0.75
+    candidates = np.where(scores_arr >= threshold)[0]
+
+    if len(candidates) <= 1:
+        subject_indices = (
+            candidates if len(candidates) == 1 else np.array([scores_arr.argmax()])
+        )
+    else:
+        sorted_idx = np.argsort([detections[i]["area"] for i in candidates])[::-1]
+        top_area = detections[candidates[sorted_idx[0]]]["area"]
+        subject_indices = np.array([
+            candidates[i] for i in sorted_idx
+            if detections[candidates[i]]["area"] >= top_area * 0.6
+        ])
+
+    if len(subject_indices) == 0:
+        subject_indices = np.array([scores_arr.argmax()])
+
+    stray_indices = np.setdiff1d(np.arange(n), subject_indices)
+    return subject_indices.astype(int), stray_indices.astype(int)
+
+
 def _tile_detect(
     model: YOLO,
     image_bgr: np.ndarray,
@@ -566,31 +627,53 @@ def analyze_image(
         )
         return result
 
-    subject_indices = np.arange(len(xyxy))
+    # 构建检测信息列表供评分使用
+    detections = [
+        {
+            "index": i,
+            "box": xyxy[i].tolist(),
+            "conf": float(conf[i]),
+            "area": float((xyxy[i, 2] - xyxy[i, 0]) * (xyxy[i, 3] - xyxy[i, 1])),
+        }
+        for i in range(len(xyxy))
+    ]
+
+    # 规则评分：识别主要人物（保留）和路人（消除）
+    subject_indices, stray_indices = select_main_subjects(detections, image_h, image_w)
+
     subject_mask = build_union_mask(masks, subject_indices)
-    stray_mask = np.zeros((image_h, image_w), dtype=bool)
-    cleaned_image = remove_people_twice(original_bgr, subject_mask)
+    stray_mask = build_union_mask(masks, stray_indices)
+
+    if len(stray_indices) > 0:
+        cleaned_image = remove_people_twice(original_bgr, stray_mask)
+    else:
+        cleaned_image = original_bgr.copy()
 
     elapsed_seconds = time.time() - start_time
+    subject_index_set = set(subject_indices.tolist())
+    stray_index_set = set(stray_indices.tolist())
     detections_summary = [
         DetectionSummary(
             index=i,
             box=xyxy[i].tolist(),
             conf=float(conf[i]),
-            score=1.0,
+            score=1.0 if i in subject_index_set else 0.0,
             area=float((xyxy[i, 2] - xyxy[i, 0]) * (xyxy[i, 3] - xyxy[i, 1])),
-            label="person",
+            label="subject" if i in subject_index_set else "stray",
         )
         for i in range(len(xyxy))
     ]
 
-    logs = [f"检测到 {len(xyxy)} 个人物，已全部移除。"]
+    logs = [
+        f"检测到 {len(xyxy)} 个人物："
+        f"保留 {len(subject_indices)} 个主体，消除 {len(stray_indices)} 个路人。"
+    ]
 
     return ProcessResult(
         input_path=str(image_path),
         output_path="",
         subject_count=len(subject_indices),
-        stray_count=0,
+        stray_count=len(stray_indices),
         elapsed_seconds=elapsed_seconds,
         original_bgr=original_bgr,
         cleaned_bgr=cleaned_image,
