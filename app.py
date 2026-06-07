@@ -282,7 +282,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    # 国内网络通过镜像站下载 HuggingFace 模型
     import os as _os
     _os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
@@ -293,5 +292,13 @@ if __name__ == "__main__":
         load_sd_pipeline()
         print("SD 模型就绪。", flush=True)
     except Exception as e:
-        print(f"SD 模型加载失败（将回退 LaMa）: {e}", flush=True)
+        # 网络不通但缓存完整时，强制离线模式重试
+        print(f"在线加载失败，尝试离线模式... ({e})", flush=True)
+        _os.environ["HF_HUB_OFFLINE"] = "1"
+        try:
+            from photo_cleaner_core import load_sd_pipeline
+            load_sd_pipeline()
+            print("SD 模型就绪（离线模式）。", flush=True)
+        except Exception as e2:
+            print(f"SD 模型加载失败（将回退 LaMa）: {e2}", flush=True)
     main()
