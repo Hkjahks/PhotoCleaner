@@ -447,7 +447,11 @@ def composite_subjects(
     feather_px: int = 3,
 ) -> np.ndarray:
     """将原图中的主体人物抠出，贴到干净背景上，边缘羽化平滑过渡。"""
-    h, w = clean_background.shape[:2]
+    h, w = original_image.shape[:2]
+
+    # 统一所有输入尺寸到原图
+    if clean_background.shape[:2] != (h, w):
+        clean_background = cv2.resize(clean_background, (w, h), interpolation=cv2.INTER_LANCZOS4)
     if subject_mask.shape[:2] != (h, w):
         subject_mask = cv2.resize(
             subject_mask.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR
