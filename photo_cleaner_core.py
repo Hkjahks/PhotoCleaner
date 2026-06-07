@@ -29,7 +29,6 @@ torch.jit.load = _patched_jit_load
 from ultralytics import YOLO
 
 from db import insert_record
-from llm_subject_selector import LLMSelectionConfig, llm_subject_select
 
 SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 
@@ -79,6 +78,121 @@ def build_union_mask(masks: np.ndarray, indices: np.ndarray) -> np.ndarray:
     return union_mask
 
 
+def compute_iou(box_a: np.ndarray, box_b: np.ndarray) -> float:
+    x1 = max(box_a[0], box_b[0])
+    y1 = max(box_a[1], box_b[1])
+    x2 = min(box_a[2], box_b[2])
+    y2 = min(box_a[3], box_b[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
+    area_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0
+
+
+def _tile_detect(
+    model: YOLO,
+    image_bgr: np.ndarray,
+    tile_size: int = 640,
+    overlap_ratio: float = 0.2,
+    conf: float = 0.05,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """重叠切片检测：将大图切为小块分别推理，再合并映射回原图坐标。
+
+    小目标在全图缩放后会变得极小（<10px），YOLO 难以识别。
+    切片让每个小块以接近原生分辨率推理，小块内的人保持可检测尺寸。
+    """
+    h, w = image_bgr.shape[:2]
+    stride = int(tile_size * (1 - overlap_ratio))
+
+    # 图太小不需要切片
+    if w <= tile_size and h <= tile_size:
+        return np.empty((0, 4)), np.empty((0,)), np.array([])
+
+    all_xyxy = []
+    all_conf = []
+    all_masks = []
+
+    y_starts = list(range(0, max(h - tile_size, 1), stride))
+    if not y_starts or y_starts[-1] + tile_size < h:
+        y_starts.append(max(0, h - tile_size))
+    x_starts = list(range(0, max(w - tile_size, 1), stride))
+    if not x_starts or x_starts[-1] + tile_size < w:
+        x_starts.append(max(0, w - tile_size))
+
+    for y1 in y_starts:
+        for x1 in x_starts:
+            y2 = min(y1 + tile_size, h)
+            x2 = min(x1 + tile_size, w)
+            tile = image_bgr[y1:y2, x1:x2]
+
+            # 补齐到 tile_size
+            if tile.shape[0] != tile_size or tile.shape[1] != tile_size:
+                tile_padded = np.zeros((tile_size, tile_size, 3), dtype=np.uint8)
+                tile_padded[: tile.shape[0], : tile.shape[1]] = tile
+                tile = tile_padded
+
+            tile_results = model(tile, classes=[0], conf=conf, imgsz=tile_size, verbose=False)
+            if not tile_results or tile_results[0].boxes is None:
+                continue
+
+            t_boxes = tile_results[0].boxes
+            t_xyxy = t_boxes.xyxy.cpu().numpy()
+            t_conf = t_boxes.conf.cpu().numpy()
+            t_masks = (
+                tile_results[0].masks.data.cpu().numpy()
+                if tile_results[0].masks is not None
+                else np.array([])
+            )
+
+            if len(t_xyxy) == 0:
+                continue
+
+            # 坐标映射回原图
+            t_xyxy[:, [0, 2]] += x1
+            t_xyxy[:, [1, 3]] += y1
+
+            all_xyxy.append(t_xyxy)
+            all_conf.append(t_conf)
+            if len(t_masks) > 0:
+                for m in t_masks:
+                    full = np.zeros((h, w), dtype=np.float32)
+                    # 取 tile 实际区域
+                    m_resized = cv2.resize(m.astype(np.float32), (x2 - x1, y2 - y1))
+                    full[y1:y2, x1:x2] = m_resized
+                    all_masks.append(full)
+
+    if not all_xyxy:
+        return np.empty((0, 4)), np.empty((0,)), np.array([])
+
+    merged_xyxy = np.concatenate(all_xyxy, axis=0)
+    merged_conf = np.concatenate(all_conf, axis=0)
+    merged_masks = np.array(all_masks) if all_masks else np.array([])
+
+    # NMS 去重：同一个人可能被多个重叠切片检测到
+    keep = _nms(merged_xyxy, merged_conf, iou_threshold=0.45)
+    return merged_xyxy[keep], merged_conf[keep], (
+        merged_masks[keep] if len(merged_masks) > 0 else np.array([])
+    )
+
+
+def _nms(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float = 0.5) -> np.ndarray:
+    """简单的非极大值抑制，按得分降序保留不重叠的框。"""
+    order = scores.argsort()[::-1]
+    keep = []
+    suppressed = np.zeros(len(order), dtype=bool)
+    for i_idx, i in enumerate(order):
+        if suppressed[i_idx]:
+            continue
+        keep.append(i)
+        for j_idx in range(i_idx + 1, len(order)):
+            if suppressed[j_idx]:
+                continue
+            if compute_iou(boxes[i], boxes[order[j_idx]]) > iou_threshold:
+                suppressed[j_idx] = True
+    return np.array(keep, dtype=int)
+
+
 @lru_cache(maxsize=1)
 def load_lama_model():
     try:
@@ -89,6 +203,101 @@ def load_lama_model():
         ) from exc
 
     return simple_lama_module.SimpleLama()
+
+
+def _get_inpaint_device() -> tuple[object, str]:
+    """检测最佳推理设备：CUDA(NVIDIA) > CPU"""
+    if torch.cuda.is_available():
+        return torch.device("cuda"), "cuda"
+    return torch.device("cpu"), "cpu"
+
+
+@lru_cache(maxsize=1)
+def load_sd_pipeline():
+    """加载 Stable Diffusion Inpainting 管线（首次调用时自动下载模型约 2.5GB）。
+
+    优先使用 CUDA GPU，无 CUDA 时使用 CPU（速度较慢但质量相同）。
+    """
+    from diffusers import StableDiffusionInpaintPipeline
+
+    device, device_type = _get_inpaint_device()
+    dtype = torch.float16 if device_type == "cuda" else torch.float32
+
+    pipe = StableDiffusionInpaintPipeline.from_pretrained(
+        "runwayml/stable-diffusion-inpainting",
+        torch_dtype=dtype,
+        safety_checker=None,
+        requires_safety_checker=False,
+    )
+    pipe = pipe.to(device)
+    if device_type == "cuda":
+        pipe.enable_attention_slicing()
+    else:
+        # CPU 模式：减少步数以缩短时间
+        pipe.set_progress_bar_config(disable=True)
+    return pipe, device_type
+
+
+def _inpaint_sd(
+    image_bgr: np.ndarray,
+    person_mask: np.ndarray,
+    guidance_scale: float = 7.5,
+) -> np.ndarray:
+    """用 Stable Diffusion Inpainting 消除人物。"""
+    pipe, device_type = load_sd_pipeline()
+
+    # CPU 用较少步数，GPU 用足量步数
+    num_steps = 15 if device_type == "cpu" else 25
+
+    h, w = image_bgr.shape[:2]
+    target_size = 512
+    scale = target_size / max(h, w)
+    if scale < 1.0:
+        new_h = (int(h * scale) // 8) * 8
+        new_w = (int(w * scale) // 8) * 8
+    else:
+        new_h = (h // 8) * 8
+        new_w = (w // 8) * 8
+
+    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    image_pil = Image.fromarray(image_rgb).resize((new_w, new_h), Image.LANCZOS)
+
+    if person_mask.shape[:2] != (new_h, new_w):
+        mask_resized = cv2.resize(
+            person_mask.astype(np.float32), (new_w, new_h), interpolation=cv2.INTER_LINEAR
+        )
+    else:
+        mask_resized = person_mask.astype(np.float32)
+    mask_pil = Image.fromarray((mask_resized > 0.5).astype(np.uint8) * 255, mode="L")
+
+    result = pipe(
+        prompt="empty clean background, no people, photorealistic, high quality, natural scene",
+        negative_prompt="person, people, human, face, body, hands, legs, head, figure, man, woman, child",
+        image=image_pil,
+        mask_image=mask_pil,
+        strength=1.0,
+        guidance_scale=guidance_scale,
+        num_inference_steps=num_steps,
+    ).images[0]
+
+    result_rgb = np.array(result.resize((w, h), Image.LANCZOS).convert("RGB"), dtype=np.uint8)
+    return cv2.cvtColor(result_rgb, cv2.COLOR_RGB2BGR)
+
+
+_SD_AVAILABLE = None
+
+
+def _sd_is_available() -> bool:
+    """检测 SD Inpainting 是否可用（只检查一次）。"""
+    global _SD_AVAILABLE
+    if _SD_AVAILABLE is not None:
+        return _SD_AVAILABLE
+    try:
+        from diffusers import StableDiffusionInpaintPipeline  # noqa: F401
+        _SD_AVAILABLE = True
+    except ImportError:
+        _SD_AVAILABLE = False
+    return _SD_AVAILABLE
 
 
 def remove_stray_people_lama(image_bgr: np.ndarray, stray_mask: np.ndarray) -> np.ndarray:
@@ -145,9 +354,54 @@ def remove_stray_people(
     return remove_stray_people_lama(image_bgr, stray_mask)
 
 
+def refine_person_mask(mask: np.ndarray, image_shape: tuple[int, int], dilation_pixels: int = 4) -> np.ndarray:
+    """膨胀掩码使其完整覆盖人物边缘（头发、衣物边界等）。
+
+    dilation_pixels: 膨胀像素数，相对于约 1000px 对角线的基准。
+    实际膨胀量会按图像对角线等比缩放。
+    """
+    if mask.size == 0:
+        return np.zeros(image_shape[:2], dtype=np.uint8)
+
+    h, w = image_shape[:2]
+    if mask.shape[:2] != (h, w):
+        mask = cv2.resize(mask.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+
+    mask_u8 = (mask > 0).astype(np.uint8) * 255
+    if np.count_nonzero(mask_u8) == 0:
+        return mask_u8
+
+    diag = np.sqrt(h * h + w * w)
+    kernel_px = max(1, int(dilation_pixels * diag / 1000))
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (kernel_px * 2 + 1, kernel_px * 2 + 1)
+    )
+    return cv2.dilate(mask_u8, kernel)
+
+
 def remove_people_twice(image_bgr: np.ndarray, person_mask: np.ndarray) -> np.ndarray:
-    cleaned_once = remove_stray_people_lama(image_bgr, person_mask)
-    return remove_stray_people_lama(cleaned_once, person_mask)
+    """消除人物：优先使用 Stable Diffusion Inpainting，不可用时回退 LaMa。"""
+    if person_mask.size == 0:
+        return image_bgr.copy()
+
+    shape = image_bgr.shape[:2]
+
+    # 尝试 SD Inpainting（效果接近商用级）
+    if _sd_is_available():
+        try:
+            mask_dilated = refine_person_mask(person_mask, shape, dilation_pixels=4)
+            cleaned = _inpaint_sd(image_bgr, mask_dilated)
+            # SD 输出可能与原图有细微色差，再做一次轻量 LaMa 统一色调
+            cleaned = remove_stray_people_lama(cleaned, mask_dilated)
+            return cleaned
+        except Exception:
+            pass  # SD 失败则回退 LaMa
+
+    # LaMa 回退方案
+    cleaned = remove_stray_people_lama(image_bgr, person_mask)
+    mask_edge = refine_person_mask(person_mask, shape, dilation_pixels=2)
+    cleaned = remove_stray_people_lama(cleaned, mask_edge)
+    return cleaned
 
 
 @lru_cache(maxsize=1)
@@ -158,9 +412,7 @@ def load_model(model_path: str = "yolov8s-seg.pt") -> YOLO:
 def analyze_image(
     image_path: str | Path,
     model_path: str = "yolov8s-seg.pt",
-    subject_score_ratio: float = 0.75,
-    min_area_ratio: float = 0.01,#降低最小面积阈值 - 检测更小的远处人物
-    llm_config: LLMSelectionConfig | None = None,
+    min_area_ratio: float = 0.01,
 ) -> ProcessResult:
     start_time = time.time()
     image_path = Path(image_path)
@@ -174,7 +426,8 @@ def analyze_image(
         raise ValueError(f"无法读取图片: {image_path}")
 
     model = load_model(model_path)
-    results = model(str(image_path), classes=[0],conf=0.02,verbose=False)#conf降低置信度阈值 - 检出更多模糊人物
+    # imgsz=1280 提升推理分辨率，让小目标有更多像素参与检测
+    results = model(str(image_path), classes=[0], conf=0.02, imgsz=1280, verbose=False)
 
     if not results:
         raise RuntimeError("模型没有返回任何结果")
@@ -186,52 +439,111 @@ def analyze_image(
     conf = boxes.conf.cpu().numpy() if boxes is not None else np.empty((0,), dtype=np.float32)
     masks = res.masks.data.cpu().numpy() if res.masks is not None else np.array([])
 
-    # 多尺度检测：放大图片检测小人物
-    if len(xyxy) < 50 and image_h * image_w > 50000:
+    # 多尺度检测：逐级放大图片检测微小/远处人物
+    original_count = len(xyxy)
+    if image_h * image_w > 50000:
+        # 多级缩放配置：(放大倍数, 置信度阈值)
+        scale_configs = [
+            (2, 0.08),   # 2x：检测中小尺寸人物
+            (3, 0.03),   # 3x：检测极小/远处人物（背面等特征不明显的）
+        ]
+        max_dim = 4000  # 限制放大后的最大尺寸，避免 OOM
+
+        for scale_factor, scale_conf in scale_configs:
+            try:
+                scaled_h = int(image_h * scale_factor)
+                scaled_w = int(image_w * scale_factor)
+                # 超出最大尺寸则等比缩小
+                if max(scaled_h, scaled_w) > max_dim:
+                    ratio = max_dim / max(scaled_h, scaled_w)
+                    scaled_h = int(scaled_h * ratio)
+                    scaled_w = int(scaled_w * ratio)
+
+                scaled_image = cv2.resize(original_bgr, (scaled_w, scaled_h))
+                scaled_results = model(scaled_image, classes=[0], conf=scale_conf, imgsz=1280, verbose=False)
+
+                if scaled_results and scaled_results[0].boxes is not None:
+                    s_boxes = scaled_results[0].boxes
+                    s_xyxy = s_boxes.xyxy.cpu().numpy()
+                    s_conf = s_boxes.conf.cpu().numpy()
+                    s_masks = (
+                        scaled_results[0].masks.data.cpu().numpy()
+                        if scaled_results[0].masks is not None
+                        else np.array([])
+                    )
+
+                    if len(s_xyxy) == 0:
+                        continue
+
+                    # 缩放坐标映射回原图尺寸
+                    scale_x = image_w / scaled_w
+                    scale_y = image_h / scaled_h
+                    s_xyxy_scaled = s_xyxy.copy()
+                    s_xyxy_scaled[:, [0, 2]] *= scale_x
+                    s_xyxy_scaled[:, [1, 3]] *= scale_y
+
+                    # 缩放 masks 回原图尺寸
+                    resized_masks = (
+                        np.array([
+                            cv2.resize(m.astype(np.float32), (image_w, image_h))
+                            for m in s_masks
+                        ])
+                        if len(s_masks) > 0
+                        else np.array([])
+                    )
+
+                    # 去重：只保留此尺度中新发现的人（与已有结果 IoU < 0.1）
+                    iou_threshold = 0.1
+                    new_mask_indices = []
+                    for i, new_box in enumerate(s_xyxy_scaled):
+                        is_duplicate = False
+                        for old_box in xyxy:
+                            if compute_iou(new_box, old_box) > iou_threshold:
+                                is_duplicate = True
+                                break
+                        if not is_duplicate:
+                            new_mask_indices.append(i)
+
+                    if new_mask_indices:
+                        new_xyxy = s_xyxy_scaled[new_mask_indices]
+                        new_conf = s_conf[new_mask_indices]
+                        new_masks = (
+                            resized_masks[new_mask_indices]
+                            if len(resized_masks) > 0
+                            else np.array([])
+                        )
+                        xyxy = np.concatenate([xyxy, new_xyxy], axis=0)
+                        conf = np.concatenate([conf, new_conf], axis=0)
+                        masks = np.concatenate([masks, new_masks], axis=0)
+            except Exception:
+                pass  # 单级放大失败不影响其他级别
+
+    # 切片检测：针对大图中 <20px 的极小人物，切成小块各自推理
+    # 触发条件：图片任一维度超过 1280px（全图缩放后小目标丢失严重）
+    if max(image_h, image_w) > 1280:
         try:
-            large_h, large_w = int(image_h * 2), int(image_w * 2)
-            large_image = cv2.resize(original_bgr, (large_w, large_h))
-            large_results = model(large_image, classes=[0], conf=0.15, verbose=False)
-            if large_results and large_results[0].masks is not None:
-                large_boxes = large_results[0].boxes
-                large_xyxy = large_boxes.xyxy.cpu().numpy()
-                large_conf = large_boxes.conf.cpu().numpy()
-                large_masks = large_results[0].masks.data.cpu().numpy()
-                # 缩放坐标映射回原图尺寸
-                scale_x = image_w / large_w
-                scale_y = image_h / large_h
-                large_xyxy_scaled = large_xyxy.copy()
-                large_xyxy_scaled[:, [0, 2]] *= scale_x
-                large_xyxy_scaled[:, [1, 3]] *= scale_y
-                # 缩放 masks 回原图尺寸
-                resized_masks = np.array([
-                    cv2.resize(m.astype(np.float32), (image_w, image_h))
-                    for m in large_masks
-                ])
-                # 去重：只保留多尺度中新发现的人（与原结果 IoU < 0.1）
+            t_xyxy, t_conf, t_masks = _tile_detect(
+                model, original_bgr, tile_size=640, overlap_ratio=0.2, conf=0.05
+            )
+            if len(t_xyxy) > 0:
+                # 去重：只保留切片中与已有结果不重叠的新发现
                 iou_threshold = 0.1
-                new_mask_indices = []
-                for i, new_box in enumerate(large_xyxy_scaled):
-                    is_duplicate = False
-                    for old_box in xyxy[:original_count]:
-                        if compute_iou(new_box, old_box) > iou_threshold:
-                            is_duplicate = True
+                new_idx = []
+                for i, tile_box in enumerate(t_xyxy):
+                    is_dup = False
+                    for old_box in xyxy:
+                        if compute_iou(tile_box, old_box) > iou_threshold:
+                            is_dup = True
                             break
-                    if not is_duplicate:
-                        new_mask_indices.append(i)
-
-                # 用新索引从多尺度结果中提取
-                if new_mask_indices:
-                    new_xyxy = large_xyxy_scaled[new_mask_indices]
-                    new_conf = large_conf[new_mask_indices]
-                    new_masks = resized_masks[new_mask_indices]
-
-                    xyxy = np.concatenate([xyxy, new_xyxy], axis=0)
-                    conf = np.concatenate([conf, new_conf], axis=0)
-                    masks = np.concatenate([masks, new_masks], axis=0)
+                    if not is_dup:
+                        new_idx.append(i)
+                if new_idx:
+                    xyxy = np.concatenate([xyxy, t_xyxy[new_idx]], axis=0)
+                    conf = np.concatenate([conf, t_conf[new_idx]], axis=0)
+                    if len(t_masks) > 0:
+                        masks = np.concatenate([masks, t_masks[new_idx]], axis=0)
         except Exception:
-            pass  # 多尺度失败不影响主流程
-            
+            pass  # 切片失败不影响主流程
 
 
     if len(xyxy) == 0:
@@ -254,50 +566,25 @@ def analyze_image(
         )
         return result
 
-    detections = [
-        {
-            "index": i,
-            "box": xyxy[i].tolist(),
-            "conf": float(conf[i]),
-            "area": float((xyxy[i, 2] - xyxy[i, 0]) * (xyxy[i, 3] - xyxy[i, 1])),
-        }
-        for i in range(len(xyxy))
-    ]
-
-    qwen_indices, selector_logs = llm_subject_select(
-        image_bgr=original_bgr,
-        detections=detections,
-        llm_config=llm_config,
-    )
-
-    all_indices = np.arange(len(xyxy))
-    qwen_index_set = set(qwen_indices.tolist())
-    all_index_set = set(all_indices.tolist())
-    if qwen_index_set != all_index_set:
-        selector_logs.append("Qwen 返回的编号不完整，已回退为删除所有检测到的人物。")
-        subject_indices = all_indices
-    else:
-        subject_indices = qwen_indices
-
+    subject_indices = np.arange(len(xyxy))
     subject_mask = build_union_mask(masks, subject_indices)
     stray_mask = np.zeros((image_h, image_w), dtype=bool)
     cleaned_image = remove_people_twice(original_bgr, subject_mask)
 
     elapsed_seconds = time.time() - start_time
-    subject_index_set = set(subject_indices.tolist())
     detections_summary = [
         DetectionSummary(
             index=i,
             box=xyxy[i].tolist(),
             conf=float(conf[i]),
-            score=1.0 if i in subject_index_set else 0.0,
+            score=1.0,
             area=float((xyxy[i, 2] - xyxy[i, 0]) * (xyxy[i, 3] - xyxy[i, 1])),
-            label="person" if i in subject_indices else "background",
+            label="person",
         )
         for i in range(len(xyxy))
     ]
 
-    logs = selector_logs + [f"检测到 {len(xyxy)} 个人物，已全部移除，并重复修复 2 次。"]
+    logs = [f"检测到 {len(xyxy)} 个人物，已全部移除。"]
 
     return ProcessResult(
         input_path=str(image_path),
@@ -348,7 +635,6 @@ def process_image(
     image_path: str | Path,
     output_dir: str | Path,
     model_path: str = "yolov8s-seg.pt",
-    llm_config: LLMSelectionConfig | None = None,
     save_masks: bool = True,
 ) -> tuple[ProcessResult, dict[str, Path]]:
     start_time = time.time()
@@ -356,7 +642,6 @@ def process_image(
         result = analyze_image(
             image_path=image_path,
             model_path=model_path,
-            llm_config=llm_config,
         )
         saved_paths = save_result(result, output_dir=output_dir, save_masks=save_masks)
 
@@ -403,7 +688,6 @@ def process_batch(
     image_paths: Iterable[str | Path],
     output_dir: str | Path,
     model_path: str = "yolov8s-seg.pt",
-    llm_config: LLMSelectionConfig | None = None,
     save_masks: bool = True,
 ) -> list[tuple[Path, ProcessResult | None, str | None]]:
     results: list[tuple[Path, ProcessResult | None, str | None]] = []
@@ -414,7 +698,6 @@ def process_batch(
                 image_path=path,
                 output_dir=output_dir,
                 model_path=model_path,
-                llm_config=llm_config,
                 save_masks=save_masks,
             )
             results.append((path, result, None))
@@ -436,7 +719,6 @@ def run_cli(
     input_path: str,
     output_dir: str,
     model_path: str = "yolov8s-seg.pt",
-    llm_config: LLMSelectionConfig | None = None,
 ) -> None:
     path = Path(input_path)
     if path.is_dir():
@@ -445,7 +727,6 @@ def run_cli(
             image_paths,
             output_dir=output_dir,
             model_path=model_path,
-            llm_config=llm_config,
         )
         print(f"共处理 {len(batch_results)} 张图片")
         for item_path, result, error in batch_results:
@@ -458,7 +739,6 @@ def run_cli(
             input_path,
             output_dir=output_dir,
             model_path=model_path,
-            llm_config=llm_config,
         )
         print(f"处理完成: {input_path}")
         print(f"输出路径: {saved_paths['output']}")

@@ -4,3 +4,7 @@ pillow
 streamlit
 ultralytics
 simple-lama-inpainting
+diffusers
+transformers
+accelerate
+safetensors

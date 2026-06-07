@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 import streamlit as st
 
-from photo_cleaner_core import LLMSelectionConfig, format_detection_lines, process_image
+from photo_cleaner_core import format_detection_lines, process_image
 
 
 st.set_page_config(
@@ -168,11 +168,11 @@ def render_hero() -> None:
         <div class="hero">
             <h1>PhotoCleaner 全人消除系统</h1>
             <p>
-                只保留单张图片入口。系统会把图片交给 Qwen 复核人物编号，再把图中所有人连续修复两次并返回前端。
+                YOLOv8-seg 检测人物 + LaMa 修复，消除图中所有人，只保留背景环境。
             </p>
             <div class="feature-grid">
                 <div class="feature-card"><div class="label">输入格式</div><div class="value">PNG / JPG / JPEG</div></div>
-                <div class="feature-card"><div class="label">AI 核心</div><div class="value">Qwen + YOLOv8-seg + LaMa</div></div>
+                <div class="feature-card"><div class="label">AI 核心</div><div class="value">YOLOv8-seg + LaMa</div></div>
                 <div class="feature-card"><div class="label">处理方式</div><div class="value">单张上传</div></div>
                 <div class="feature-card"><div class="label">结果输出</div><div class="value">前端展示 + 下载</div></div>
             </div>
@@ -183,19 +183,9 @@ def render_hero() -> None:
 
 
 def sidebar_settings() -> dict[str, object]:
-    st.sidebar.markdown("### Qwen 配置")
-    llm_base_url = st.sidebar.text_input("大模型接口地址", value="http://localhost:11434/v1")
-    llm_model = st.sidebar.text_input("大模型名称", value="qwen2.5-vl")
-    llm_api_key = st.sidebar.text_input("大模型 API Key", value="", type="password")
-    st.sidebar.caption("Qwen 只负责复核人物编号，最终会删除图中所有人并重复修复两次。")
-
-    return {
-        "llm_config": LLMSelectionConfig(
-            base_url=llm_base_url,
-            model=llm_model,
-            api_key=llm_api_key,
-        ),
-    }
+    st.sidebar.markdown("### 处理说明")
+    st.sidebar.caption("YOLOv8-seg 检测人物 + LaMa 修复，消除图中所有人。")
+    return {}
 
 
 def show_result(result, saved_paths: dict[str, Path]) -> None:
@@ -246,7 +236,7 @@ def handle_single_mode(settings: dict[str, object]) -> None:
 
     with right:
         st.markdown("#### 处理说明")
-        st.write("系统会把图片交给 Qwen 复核，再把图中所有人连续修复两次。")
+        st.write("YOLO 检测人物后 LaMa 修复去除，输出只保留背景。")
         start_button = st.button("开始处理单张图片", use_container_width=True)
 
     if not start_button:
@@ -266,7 +256,6 @@ def handle_single_mode(settings: dict[str, object]) -> None:
             image_path=temp_path,
             output_dir=output_dir,
             model_path="yolov8s-seg.pt",
-            llm_config=settings["llm_config"],
             save_masks=False,
         )
 
@@ -293,4 +282,16 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # 国内网络通过镜像站下载 HuggingFace 模型
+    import os as _os
+    _os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+
+    import sys
+    print("正在检查 Stable Diffusion 模型...", flush=True)
+    try:
+        from photo_cleaner_core import load_sd_pipeline
+        load_sd_pipeline()
+        print("SD 模型就绪。", flush=True)
+    except Exception as e:
+        print(f"SD 模型加载失败（将回退 LaMa）: {e}", flush=True)
     main()
