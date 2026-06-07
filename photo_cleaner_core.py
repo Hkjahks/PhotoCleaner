@@ -151,6 +151,64 @@ def select_main_subjects(
     return subject_indices.astype(int), stray_indices.astype(int)
 
 
+def _merge_overlapping_boxes(boxes: list[list[float]]) -> list[list[float]]:
+    """合并重叠边界框，避免同一个人被多次裁剪处理。"""
+    if len(boxes) <= 1:
+        return boxes
+    merged = [boxes[0].copy()]
+    for box in boxes[1:]:
+        found = False
+        for i, m in enumerate(merged):
+            if compute_iou(np.array(box), np.array(m)) > 0.05:
+                merged[i] = [
+                    min(box[0], m[0]), min(box[1], m[1]),
+                    max(box[2], m[2]), max(box[3], m[3]),
+                ]
+                found = True
+                break
+        if not found:
+            merged.append(box.copy())
+    return merged
+
+
+def _inpaint_regions_sd(
+    image_bgr: np.ndarray,
+    mask_full: np.ndarray,
+    boxes: np.ndarray,
+) -> np.ndarray:
+    """按人物区域裁剪送 SD 局部修复，只贴回掩码区域。"""
+    result = image_bgr.copy()
+    h, w = image_bgr.shape[:2]
+
+    merged = _merge_overlapping_boxes(boxes.tolist())
+
+    for (x1, y1, x2, y2) in merged:
+        box_w, box_h = x2 - x1, y2 - y1
+        pad_x = int(box_w * 0.3)
+        pad_y = int(box_h * 0.3)
+        cx1 = max(0, int(x1) - pad_x)
+        cy1 = max(0, int(y1) - pad_y)
+        cx2 = min(w, int(x2) + pad_x)
+        cy2 = min(h, int(y2) + pad_y)
+
+        if cx2 - cx1 < 64 or cy2 - cy1 < 64:
+            continue  # 太小的区域跳过
+
+        crop = image_bgr[cy1:cy2, cx1:cx2].copy()
+        crop_mask = mask_full[cy1:cy2, cx1:cx2]
+
+        try:
+            crop_cleaned = _inpaint_sd(crop, crop_mask)
+        except Exception:
+            continue
+
+        # 只贴回掩码区域，其余保持原样
+        mask_area = crop_mask > 0
+        result[cy1:cy2, cx1:cx2][mask_area] = crop_cleaned[mask_area]
+
+    return result
+
+
 def _tile_detect(
     model: YOLO,
     image_bgr: np.ndarray,
@@ -687,23 +745,21 @@ def analyze_image(
     # 规则评分：识别主要人物（保留）和路人（消除）
     subject_indices, stray_indices = select_main_subjects(detections, image_h, image_w)
 
-    # 第一步：消除所有人，得到干净背景
-    all_indices = np.arange(len(xyxy))
-    all_people_mask = build_union_mask(masks, all_indices)
-    clean_background = remove_people_twice(original_bgr, all_people_mask)
-
-    # 第二步：从原图抠出主体人物，贴回干净背景
     subject_mask = build_union_mask(masks, subject_indices)
     stray_mask = build_union_mask(masks, stray_indices)
 
-    if len(subject_indices) > 0 and len(stray_indices) > 0:
-        # 有路人需要消除，同时保留主体
-        cleaned_image = composite_subjects(clean_background, original_bgr, subject_mask)
-    elif len(stray_indices) > 0:
-        # 全是路人 → 直接输出干净背景
-        cleaned_image = clean_background
+    if len(stray_indices) > 0:
+        # 按路人区域裁剪，逐个送 SD 局部修复
+        if _sd_is_available():
+            stray_boxes = xyxy[stray_indices]
+            cleaned_image = _inpaint_regions_sd(original_bgr, stray_mask, stray_boxes)
+        else:
+            # 无 SD 时用 LaMa 处理全图路人区域
+            mask_dilated = refine_person_mask(stray_mask, (image_h, image_w), dilation_pixels=4)
+            cleaned_image = remove_stray_people_lama(original_bgr, mask_dilated)
+            mask_edge = refine_person_mask(stray_mask, (image_h, image_w), dilation_pixels=2)
+            cleaned_image = remove_stray_people_lama(cleaned_image, mask_edge)
     else:
-        # 没有路人 → 原样输出
         cleaned_image = original_bgr.copy()
 
     elapsed_seconds = time.time() - start_time
